@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///./research_platform.db"
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
+    LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: Union[List[str], str] = ["http://localhost:5173", "http://127.0.0.1:5173", "*"]
 
     # Provider Settings

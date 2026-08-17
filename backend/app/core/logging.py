@@ -4,7 +4,8 @@ from app.core.config import settings
 
 
 def setup_logging():
-    log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+    level_str = getattr(settings, "LOG_LEVEL", "INFO")
+    log_level = getattr(logging, level_str.upper() if isinstance(level_str, str) else "INFO", logging.INFO)
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
