@@ -28,6 +28,7 @@ from app.providers.base import (
     ConclusionCandidate,
     ContradictionCandidate,
     FindingCandidate,
+    SemanticRelevanceItem,
     SourceDocumentInput,
     SubQuestionCandidate,
 )
@@ -36,6 +37,18 @@ logger = logging.getLogger(__name__)
 
 
 # Structured Wrapper Pydantic Schemas for Gemini Structured JSON Output
+class SemanticRelevanceItemResponse(BaseModel):
+    url: str = Field(..., description="Canonical source URL")
+    is_relevant: bool = Field(..., description="Whether this search candidate directly provides evidence for the sub-question")
+    relevance_score: float = Field(0.80, description="Semantic relevance score 0.0 to 1.0")
+    matched_concepts: List[str] = Field(default_factory=list, description="Key concepts or topics from the question addressed by this source")
+    reason: str = Field(..., description="Brief explainable justification for relevance")
+
+
+class SemanticRelevanceBatchResponse(BaseModel):
+    evaluations: List[SemanticRelevanceItemResponse]
+
+
 class SubQuestionListResponse(BaseModel):
     sub_questions: List[SubQuestionCandidate]
 
@@ -58,6 +71,83 @@ class GeminiAIProvider(AIProvider):
     Uses structured output (Pydantic schemas) to guarantee validated model output.
     All synchronous SDK network calls are dispatched via asyncio.to_thread for true non-blocking concurrency.
     """
+
+    async def evaluate_sources_relevance_batch(
+        self, sub_question: str, candidate_sources: List[Dict[str, Any]]
+    ) -> List[SemanticRelevanceItem]:
+        """
+        Stage 2B: Evaluate semantic relevance of candidates in a single batched structured call.
+        """
+        if not candidate_sources:
+            return []
+
+        if not self.client or not settings.ENABLE_SEMANTIC_RELEVANCE_LLM:
+            return [
+                SemanticRelevanceItem(
+                    url=c.get("url", ""),
+                    is_relevant=True,
+                    relevance_score=c.get("candidate_score", 0.70),
+                    matched_concepts=c.get("matched_concepts", []),
+                    reason=f"Matched candidate concept {c.get('matched_concepts', ['domain_signal'])}",
+                )
+                for c in candidate_sources
+            ]
+
+        items_str = "\n".join([
+            f"- URL: {c.get('url')}\n  Title: {c.get('title')}\n  Snippet: {c.get('snippet', '')}\n  Candidate Score: {c.get('candidate_score', 0.5):.2f}"
+            for c in candidate_sources
+        ])
+
+        prompt = f"""You are an enterprise research intelligence evaluator.
+Evaluate the semantic relevance of the following search candidate sources for the specific sub-question:
+
+SUB-QUESTION:
+"{sub_question}"
+
+CANDIDATE SOURCES:
+{items_str}
+
+Evaluate whether each source is relevant to answering the sub-question.
+Be inclusive of sources discussing related technologies, market statistics, regulatory policies, infrastructure impact, or sector analysis even if the headline uses different wording.
+Only mark is_relevant=false if the source is completely off-topic or irrelevant.
+"""
+        try:
+            from google.genai import types
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SemanticRelevanceBatchResponse,
+                temperature=0.1,
+            )
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_name,
+                contents=prompt,
+                config=config,
+            )
+            data = json.loads(response.text)
+            parsed = SemanticRelevanceBatchResponse.model_validate(data)
+            return [
+                SemanticRelevanceItem(
+                    url=item.url,
+                    is_relevant=item.is_relevant,
+                    relevance_score=item.relevance_score,
+                    matched_concepts=item.matched_concepts,
+                    reason=item.reason,
+                )
+                for item in parsed.evaluations
+            ]
+        except Exception as e:
+            logger.warning(f"Batch semantic relevance evaluation fallback: {e}")
+            return [
+                SemanticRelevanceItem(
+                    url=c.get("url", ""),
+                    is_relevant=True,
+                    relevance_score=c.get("candidate_score", 0.70),
+                    matched_concepts=c.get("matched_concepts", []),
+                    reason="Validated by candidate match",
+                )
+                for c in candidate_sources
+            ]
 
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         self.api_key = api_key if api_key is not None else settings.GEMINI_API_KEY

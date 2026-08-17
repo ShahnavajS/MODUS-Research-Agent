@@ -1,35 +1,91 @@
 """
-Deterministic Source Relevance Evaluator Engine.
+Deterministic Source Relevance Evaluator & Candidate Engine.
 
-Scores search results using explainable, deterministic signals:
-  - title_match:   Token overlap between search query keywords and document title
-  - snippet_match: Term frequency intersection between search query and snippet
-  - concept_match: Important concept coverage (entities, technologies, domains)
-  - domain_quality: Category weight based on domain classification
+Implements Stage 2A of the Two-Stage Retrieval Pipeline:
+  - Canonicalizes URLs and strips tracking parameters
+  - Enforces Hard-Exclusion Policy (Social Media, User Forums, Calculators, Dictionaries)
+  - Scores search candidates via:
+      * title_match: Token overlap between search query/concepts and document title
+      * snippet_match: Term frequency and concept overlap in snippet
+      * concept_match: Dynamic entity and domain phrase overlap from sub-question
+      * domain_quality: Category weight based on domain classification
+  - Enforces Domain Diversity Constraints (Max N sources per domain)
 
-Composite formula (configurable weights):
-  relevance_score = W_title * title_match + W_snippet * snippet_match
-                  + W_concept * concept_match + W_domain * domain_quality
-
-This score represents RETRIEVAL RELEVANCE only — it does not claim factual correctness.
+This score represents RETRIEVAL CANDIDATE ELIGIBILITY — semantic validation occurs in Stage 2B.
 """
 
 import re
 import logging
-from typing import List, Optional, Set
-from urllib.parse import urlparse
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# ─── Configurable Scoring Weights ───────────────────────────────────────────
+# ─── Configurable Candidate Scoring Weights ─────────────────────────────────
 
 WEIGHT_TITLE = 0.35
-WEIGHT_SNIPPET = 0.35
+WEIGHT_SNIPPET = 0.30
 WEIGHT_CONCEPT = 0.20
-WEIGHT_DOMAIN = 0.10
+WEIGHT_DOMAIN = 0.15
 
-# ─── English Stop Words (lightweight, no external deps) ─────────────────────
+# ─── URL Canonicalization & Parameter Cleansing ─────────────────────────────
+
+_TRACKING_PARAM_PREFIXES = ("utm_", "ga_", "mc_", "_hs", "pk_")
+_TRACKING_PARAM_EXACT = {
+    "ref", "ref_src", "fbclid", "gclid", "msclkid", "twclid", "igshid",
+    "spm", "from_source", "feature", "source", "share", "ncid", "ocid",
+    "session_id", "client_id", "s_kwcid", "dclid", "zanpid",
+}
+
+
+def canonicalize_url(url: str) -> str:
+    """
+    Deterministically canonicalize a URL:
+      - Lowercase scheme and domain
+      - Strip tracking/analytics parameters
+      - Strip URL fragments (#...)
+      - Strip trailing slash for consistency
+    """
+    if not url or not isinstance(url, str):
+        return ""
+
+    url_str = url.strip()
+    try:
+        parsed = urlparse(url_str)
+        scheme = parsed.scheme.lower() or "https"
+        netloc = parsed.netloc.lower()
+
+        # Remove default port
+        if netloc.endswith(":80"):
+            netloc = netloc[:-3]
+        elif netloc.endswith(":443"):
+            netloc = netloc[:-4]
+
+        # Strip tracking query parameters
+        clean_params = {}
+        if parsed.query:
+            query_dict = parse_qs(parsed.query, keep_blank_values=False)
+            for k, v in query_dict.items():
+                k_lower = k.lower()
+                if k_lower in _TRACKING_PARAM_EXACT or any(k_lower.startswith(p) for p in _TRACKING_PARAM_PREFIXES):
+                    continue
+                clean_params[k] = v[0] if len(v) == 1 else v
+
+        clean_query = urlencode(clean_params, doseq=True) if clean_params else ""
+
+        # Normalize path
+        path = parsed.path or "/"
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+
+        canonical = urlunparse((scheme, netloc, path, parsed.params, clean_query, ""))
+        return canonical
+    except Exception:
+        return url_str
+
+
+# ─── English Stop Words ─────────────────────────────────────────────────────
 
 _STOP_WORDS: Set[str] = {
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -46,6 +102,62 @@ _STOP_WORDS: Set[str] = {
     "there", "here", "as", "into", "through", "during", "before", "after",
     "above", "below", "between", "same", "because",
 }
+
+
+# ─── Dynamic Concept & Entity Extraction (Generic / No Hardcoding) ──────────
+
+def extract_key_concepts(text: str, max_concepts: int = 10) -> List[str]:
+    """
+    Dynamically extract domain-agnostic key concepts, acronyms, and entity phrases.
+    Works for any subject (AI infrastructure, clinical medicine, monetary policy, etc.)
+    without hardcoding.
+    """
+    if not text:
+        return []
+
+    concepts: List[str] = []
+    seen: Set[str] = set()
+
+    # 1. Capitalized multi-word named entities & phrases (e.g. "Data Center", "Reserve Bank")
+    cap_phrases = re.findall(r"\b[A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+)+\b", text)
+    for phrase in cap_phrases:
+        p_clean = phrase.strip().lower()
+        if p_clean not in seen and len(p_clean) > 3:
+            seen.add(p_clean)
+            concepts.append(p_clean)
+
+    # 2. Acronyms & technical abbreviations (e.g. "AI", "HBM", "GPU", "GDP", "LLM", "TSMC")
+    acronyms = re.findall(r"\b[A-Z]{2,6}\b", text)
+    for acr in acronyms:
+        a_lower = acr.lower()
+        if a_lower not in seen and a_lower not in _STOP_WORDS:
+            seen.add(a_lower)
+            concepts.append(a_lower)
+
+    # 3. Hyphenated technical compound terms (e.g. "data-center", "water-energy")
+    hyphenated = re.findall(r"\b[a-zA-Z0-9]+-[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*\b", text)
+    for hyp in hyphenated:
+        h_lower = hyp.lower()
+        if h_lower not in seen:
+            seen.add(h_lower)
+            concepts.append(h_lower)
+
+    # 4. Content words & bigrams
+    words = re.findall(r"[a-zA-Z0-9]+", text.lower())
+    content_words = [w for w in words if w not in _STOP_WORDS and len(w) > 2]
+
+    for i in range(len(content_words) - 1):
+        bigram = f"{content_words[i]} {content_words[i+1]}"
+        if bigram not in seen:
+            seen.add(bigram)
+            concepts.append(bigram)
+
+    for w in content_words:
+        if w not in seen:
+            seen.add(w)
+            concepts.append(w)
+
+    return concepts[:max_concepts]
 
 
 # ─── Hard Exclusion Patterns (Deterministic Policy) ─────────────────────────
@@ -103,6 +215,7 @@ REJECTION_REASON_AUDIT_LABELS: dict[str, str] = {
     "insufficient_relevance": "INSUFFICIENT_RELEVANCE",
     "empty_url": "INVALID_URL",
     "invalid_url": "INVALID_URL",
+    "domain_diversity_cap": "DOMAIN_DIVERSITY_CAP",
 }
 
 _HARD_EXCLUDED_PATH_PATTERNS = [
@@ -211,38 +324,21 @@ def classify_domain(url: str) -> tuple[str, float]:
     return "general_web", 0.70
 
 
-# ─── Token Processing Utilities ─────────────────────────────────────────────
-
-def _tokenize(text: str) -> List[str]:
-    """Tokenize text to lowercase alphanumeric words, removing stop words."""
-    words = re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", text.lower())
-    return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
-
-
-def _jaccard(set_a: Set[str], set_b: Set[str]) -> float:
-    """Jaccard similarity coefficient between two sets."""
-    if not set_a or not set_b:
-        return 0.0
-    intersection = set_a & set_b
-    union = set_a | set_b
-    return len(intersection) / len(union) if union else 0.0
-
-
 # ─── Source Role Classification ─────────────────────────────────────────────
 
 def classify_source_role(source_type: str, domain_quality: float, relevance_score: float) -> str:
     """
     Classify source into one of four roles:
-    - PRIMARY: High quality domain (>= 0.85) + strong relevance (>= 0.50)
-    - SECONDARY: Good domain (>= 0.70) + good relevance (>= 0.35)
+    - PRIMARY: High quality domain (>= 0.85) + strong relevance (>= 0.40)
+    - SECONDARY: Good domain (>= 0.70) + good relevance (>= 0.25)
     - SUPPORTING: Valid source with moderate relevance
     - DISCOVERY_ONLY: Forums, social media, reference dictionaries (domain quality < 0.40)
     """
     if domain_quality < 0.40 or source_type in ("community_forum", "social_media", "reference_dictionary"):
         return "DISCOVERY_ONLY"
-    if domain_quality >= 0.85 and relevance_score >= 0.50:
+    if domain_quality >= 0.85 and relevance_score >= 0.40:
         return "PRIMARY"
-    if domain_quality >= 0.70 and relevance_score >= 0.35:
+    if domain_quality >= 0.70 and relevance_score >= 0.25:
         return "SECONDARY"
     return "SUPPORTING"
 
@@ -250,7 +346,7 @@ def classify_source_role(source_type: str, domain_quality: float, relevance_scor
 # ─── Relevance Result Model ─────────────────────────────────────────────────
 
 class SourceRelevanceResult(BaseModel):
-    """Explainable relevance evaluation result for a search result."""
+    """Explainable candidate relevance evaluation result for a search result."""
     relevance_score: float = Field(..., description="Composite relevance score 0.0-1.0")
     title_match: float = Field(..., description="Title/query token overlap score")
     snippet_match: float = Field(..., description="Snippet/query concept overlap score")
@@ -258,13 +354,14 @@ class SourceRelevanceResult(BaseModel):
     domain_quality: float = Field(..., description="Domain type quality signal")
     source_type: str = Field(..., description="Classified source type")
     source_role: str = Field("SUPPORTING", description="Classified source role: PRIMARY | SECONDARY | SUPPORTING | DISCOVERY_ONLY")
-    is_relevant: bool = Field(..., description="Whether source meets minimum relevance threshold")
-    is_hard_excluded: bool = Field(False, description="Whether source is deterministically hard-blocked (e.g. social, forums, dictionaries)")
+    is_relevant: bool = Field(..., description="Whether source meets minimum candidate threshold")
+    is_hard_excluded: bool = Field(False, description="Whether source is deterministically hard-blocked")
     rejection_reason: str = Field("", description="Specific rejection reason if not relevant or hard excluded")
+    matched_concepts: List[str] = Field(default_factory=list, description="Dynamic concepts matched in document")
     reasoning: str = Field("", description="Human-readable relevance explanation")
 
 
-# ─── Core Evaluator Function ────────────────────────────────────────────────
+# ─── Core Evaluator Function (Stage 2A: Candidate Filter) ───────────────────
 
 def evaluate_source_relevance(
     title: str,
@@ -273,11 +370,11 @@ def evaluate_source_relevance(
     query: str,
     sub_question: str = "",
     research_question: str = "",
-    min_score: float = 0.20,
+    min_score: float = 0.15,
 ) -> SourceRelevanceResult:
     """
-    Deterministic source relevance evaluation.
-    Evaluates hard exclusion policy, title match, snippet match, concept match, and domain quality against the query.
+    Deterministic broad candidate relevance evaluation (Stage 2A).
+    Evaluates hard exclusion policy, title match, snippet match, dynamic concept match, and domain quality.
     """
     # 0. Check Hard Exclusion Policy
     is_blocked, block_reason = is_hard_excluded_source(url)
@@ -298,36 +395,42 @@ def evaluate_source_relevance(
             reasoning=f"Hard excluded by source policy: {block_reason}",
         )
 
-    # Tokenize the specific search query and sub-question
-    query_tokens = set(_tokenize(f"{query} {sub_question}"))
-    if not query_tokens:
-        query_tokens = set(_tokenize(research_question))
+    # Extract dynamic key concepts from query and sub-question
+    target_concepts = extract_key_concepts(f"{query} {sub_question}")
+    query_content_tokens = set([w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOP_WORDS and len(w) > 2])
 
-    title_tokens = set(_tokenize(title))
-    snippet_tokens = set(_tokenize(snippet))
+    title_lower = (title or "").lower()
+    snippet_lower = (snippet or "").lower()
+    doc_text = f"{title_lower} {snippet_lower}"
 
-    # 1. Title Match: compute overlap between query keywords and title
-    if query_tokens and title_tokens:
-        overlap_query_in_title = len(query_tokens & title_tokens) / len(query_tokens)
-        overlap_title_in_query = len(query_tokens & title_tokens) / len(title_tokens)
-        jaccard = _jaccard(query_tokens, title_tokens)
-        title_match = round(max(overlap_query_in_title, overlap_title_in_query * 0.8, jaccard), 4)
+    title_tokens = set([w for w in re.findall(r"[a-z0-9]+", title_lower) if w not in _STOP_WORDS and len(w) > 1])
+    snippet_tokens = set([w for w in re.findall(r"[a-z0-9]+", snippet_lower) if w not in _STOP_WORDS and len(w) > 1])
+
+    # 1. Title Match
+    if query_content_tokens and title_tokens:
+        overlap_q_in_title = len(query_content_tokens & title_tokens) / len(query_content_tokens)
+        title_match = round(min(1.0, overlap_q_in_title * 1.2), 4)
     else:
         title_match = 0.0
 
-    # 2. Snippet Match: what fraction of query keywords appear in snippet
-    if query_tokens and snippet_tokens:
-        overlap_in_snippet = len(query_tokens & snippet_tokens) / len(query_tokens)
-        jaccard_snippet = _jaccard(query_tokens, snippet_tokens)
-        snippet_match = round(max(overlap_in_snippet, jaccard_snippet * 1.2), 4)
-        snippet_match = min(1.0, snippet_match)
+    # 2. Snippet Match
+    if query_content_tokens and snippet_tokens:
+        overlap_q_in_snippet = len(query_content_tokens & snippet_tokens) / len(query_content_tokens)
+        snippet_match = round(min(1.0, overlap_q_in_snippet * 1.1), 4)
     else:
         snippet_match = 0.0
 
-    # 3. Concept Match: multi-word phrases and domain keywords
-    concept_match = _compute_concept_match(query, f"{title} {snippet}")
+    # 3. Dynamic Concept & Entity Match
+    matched_concepts: List[str] = []
+    if target_concepts:
+        for c in target_concepts:
+            if c in doc_text:
+                matched_concepts.append(c)
+        concept_match = round(len(matched_concepts) / len(target_concepts), 4)
+    else:
+        concept_match = 0.0
 
-    # Composite Score
+    # Composite Candidate Score
     raw_score = (
         WEIGHT_TITLE * title_match
         + WEIGHT_SNIPPET * snippet_match
@@ -343,7 +446,7 @@ def evaluate_source_relevance(
     reasoning = (
         f"title={title_match:.2f} snippet={snippet_match:.2f} "
         f"concept={concept_match:.2f} domain={domain_quality:.2f} "
-        f"-> composite={relevance_score:.3f} [{source_role}] ({'RELEVANT' if is_relevant else 'REJECTED'})"
+        f"-> composite={relevance_score:.3f} [{source_role}] ({'CANDIDATE' if is_relevant else 'REJECTED'})"
     )
 
     return SourceRelevanceResult(
@@ -357,33 +460,46 @@ def evaluate_source_relevance(
         is_relevant=is_relevant,
         is_hard_excluded=False,
         rejection_reason=rejection_reason,
+        matched_concepts=matched_concepts,
         reasoning=reasoning,
     )
 
 
-def _compute_concept_match(query_text: str, result_text: str) -> float:
+# ─── Retrieval Diversity Filter ─────────────────────────────────────────────
+
+def apply_domain_diversity_filter(
+    candidate_sources: List[dict],
+    max_per_domain: int = 2,
+) -> Tuple[List[dict], List[dict]]:
     """
-    Extract key multi-word phrases and content terms from query and check presence in result text.
+    Enforces domain diversity constraints across candidate sources.
+    Prevents a single domain from dominating the candidate set while preserving
+    a balanced distribution across diverse categories (gov, academic, news, industry).
+
+    Returns (accepted_candidates, rejected_candidates).
     """
-    query_lower = query_text.lower()
-    result_lower = result_text.lower()
+    domain_counts: Dict[str, int] = {}
+    accepted: List[dict] = []
+    rejected: List[dict] = []
 
-    words = re.findall(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", query_lower)
-    content_words = [w for w in words if w not in _STOP_WORDS and len(w) > 2]
+    for item in candidate_sources:
+        src = item.get("source")
+        url = src.url if hasattr(src, "url") else item.get("url", "")
+        try:
+            domain = urlparse(url).netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+        except Exception:
+            domain = "unknown"
 
-    if not content_words:
-        return 0.0
+        count = domain_counts.get(domain, 0)
+        if count < max_per_domain:
+            domain_counts[domain] = count + 1
+            accepted.append(item)
+        else:
+            rejected.append({
+                **item,
+                "rejection_reason": f"DOMAIN_DIVERSITY_CAP (max {max_per_domain} per domain '{domain}')",
+            })
 
-    # Bigrams
-    concepts: List[str] = []
-    for i in range(len(content_words) - 1):
-        concepts.append(f"{content_words[i]} {content_words[i+1]}")
-
-    # Individual key terms
-    concepts.extend(content_words)
-
-    if not concepts:
-        return 0.0
-
-    found = sum(1 for c in concepts if c in result_lower)
-    return round(min(1.0, found / len(concepts)), 4)
+    return accepted, rejected

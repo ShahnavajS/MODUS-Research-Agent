@@ -25,8 +25,12 @@ class Settings(BaseSettings):
     CONTENT_EXTRACTION_TIMEOUT_SECONDS: float = 8.0
     MAX_DOCUMENT_SIZE_BYTES: int = 500_000
 
-    # Source Relevance & Filtering
+    # Source Relevance & Filtering (Two-Stage System)
     MIN_SOURCE_RELEVANCE_SCORE: float = 0.20
+    CANDIDATE_RELEVANCE_THRESHOLD: float = 0.15
+    MAX_SOURCES_PER_DOMAIN: int = 2
+    MAX_CANDIDATES_PER_SUBQUESTION: int = 6
+    ENABLE_SEMANTIC_RELEVANCE_LLM: bool = True
     MIN_CONTENT_WORD_COUNT: int = 30
 
     # Performance & Concurrency

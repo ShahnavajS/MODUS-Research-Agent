@@ -35,6 +35,9 @@ from app.evaluation.relevance import (
     classify_domain,
     classify_source_role,
     is_hard_excluded_source,
+    canonicalize_url,
+    extract_key_concepts,
+    apply_domain_diversity_filter,
     REJECTION_REASON_AUDIT_LABELS,
 )
 from app.models import (
@@ -153,22 +156,24 @@ class ResearchPipelineService:
 
             logger.info(f"[stage1_complete] run_id={run_id} sub_questions={len(persisted_sub_qs)} constraints={constraint_meta}")
 
-            # ─── STAGE 2: Parallel Search & Deterministic Relevance Filtering ───
+            # ─── STAGE 2: Parallel Search & Two-Stage Retrieval System ─────────
             t0 = time.time()
             search_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SEARCHES)
-            seen_normalized_urls: Set[str] = set()
+            seen_canonical_urls: Set[str] = set()
             seen_titles_by_domain: Dict[str, List[str]] = {}
             source_type_counter: Counter = Counter()
+            domain_counter: Counter = Counter()
 
             discovered_count = 0
-            relevant_count = 0
+            candidate_count = 0
+            semantically_relevant_count = 0
             rejected_irrelevant_count = 0
             search_success_count = 0
             search_failure_count = 0
             rejected_irrelevant_sources_list: List[dict] = []
 
-            # Relevant sources ready for fetching
-            relevant_sources_data: List[dict] = []
+            # Group candidates by sub-question for batched semantic validation
+            candidates_by_sub_q: Dict[UUID, List[dict]] = {}
 
             # 1. Build list of focused search queries across all sub-questions
             query_plan: List[Tuple[str, ResearchSubQuestion]] = []
@@ -180,7 +185,7 @@ class ResearchPipelineService:
                 for q_str in queries:
                     query_plan.append((q_str, sub_q))
 
-            # 2. Execute search queries concurrently with bounded semaphore and slight staggering
+            # 2. Execute search queries concurrently with bounded semaphore
             async def _execute_single_search(query_str: str, sub_q: ResearchSubQuestion, delay_offset: float = 0.0):
                 if delay_offset > 0:
                     await asyncio.sleep(delay_offset)
@@ -194,12 +199,14 @@ class ResearchPipelineService:
                         return query_str, sub_q, [], s_err
 
             search_tasks = [
-                _execute_single_search(q, sq, delay_offset=idx * 0.25)
+                _execute_single_search(q, sq, delay_offset=idx * 0.20)
                 for idx, (q, sq) in enumerate(query_plan)
             ]
             search_responses = await asyncio.gather(*search_tasks)
 
-            # 3. Process search results deterministically in plan order
+            # 3. Process search results: Canonicalization & Stage 2A Candidate Filter
+            raw_candidates_per_sub_q: Dict[UUID, List[dict]] = {}
+
             for query_str, sub_q, search_results, s_err in search_responses:
                 if s_err is not None:
                     search_failure_count += 1
@@ -209,8 +216,9 @@ class ResearchPipelineService:
                 search_success_count += 1
 
                 for res in search_results:
-                    norm_url = normalize_url(res.url)
-                    if not norm_url or norm_url in seen_normalized_urls:
+                    # Canonicalize URL (strips utm/tracking parameters and normalizes protocol/trailing slash)
+                    canonical_url = canonicalize_url(res.url)
+                    if not canonical_url or canonical_url in seen_canonical_urls:
                         continue
 
                     # Near-duplicate title/domain check
@@ -223,19 +231,19 @@ class ResearchPipelineService:
                     if is_dup:
                         continue
 
-                    seen_normalized_urls.add(norm_url)
+                    seen_canonical_urls.add(canonical_url)
                     seen_titles_by_domain.setdefault(domain, []).append(res.title)
                     discovered_count += 1
 
-                    # Relevance evaluation (deterministic)
+                    # Stage 2A: Broad Candidate Evaluation (Candidate threshold e.g. 0.15)
                     rel_result = evaluate_source_relevance(
                         title=res.title,
                         snippet=res.snippet,
-                        url=norm_url,
+                        url=canonical_url,
                         query=query_str,
                         sub_question=sub_q.question,
                         research_question=question_obj.question,
-                        min_score=settings.MIN_SOURCE_RELEVANCE_SCORE,
+                        min_score=settings.CANDIDATE_RELEVANCE_THRESHOLD,
                     )
 
                     source_type_counter[rel_result.source_type] += 1
@@ -246,17 +254,17 @@ class ResearchPipelineService:
                         audit_reason = REJECTION_REASON_AUDIT_LABELS.get(raw_reason, raw_reason.upper())
 
                         rejected_irrelevant_sources_list.append({
-                            "url": norm_url,
+                            "url": canonical_url,
                             "title": res.title,
                             "source_type": rel_result.source_type,
                             "is_hard_excluded": rel_result.is_hard_excluded,
                             "reason": audit_reason,
                         })
-                        # Persist rejected source record for full audit trail
+                        # Persist rejected source record for complete audit trail
                         source = ResearchSource(
                             research_run_id=run.id,
                             title=res.title,
-                            url=norm_url,
+                            url=canonical_url,
                             publisher=res.publisher,
                             published_at=res.published_at,
                             source_type=rel_result.source_type,
@@ -280,47 +288,165 @@ class ResearchPipelineService:
                             },
                         )
                         self.session.add(source)
-                        logger.debug(
-                            f"[relevance_rejected] url='{norm_url}' "
-                            f"reason='{audit_reason}' [{rel_result.source_role}]"
-                        )
                         continue
 
-                    relevant_count += 1
+                    # Candidate passed Stage 2A
+                    candidate_count += 1
+                    raw_candidates_per_sub_q.setdefault(sub_q.id, []).append({
+                        "res": res,
+                        "url": canonical_url,
+                        "query": query_str,
+                        "sub_q": sub_q,
+                        "rel": rel_result,
+                        "candidate_score": rel_result.relevance_score,
+                        "matched_concepts": rel_result.matched_concepts,
+                    })
 
-                    # Persist source record
+            # 4. Apply Domain Diversity Cap across candidates for each sub-question
+            diversity_accepted_candidates: List[dict] = []
+            for sub_q_id, c_list in raw_candidates_per_sub_q.items():
+                accepted, div_rejected = apply_domain_diversity_filter(
+                    c_list, max_per_domain=settings.MAX_SOURCES_PER_DOMAIN
+                )
+                diversity_accepted_candidates.extend(accepted)
+
+                for item in div_rejected:
+                    res = item["res"]
+                    rejected_irrelevant_count += 1
+                    audit_reason = item.get("rejection_reason", "DOMAIN_DIVERSITY_CAP")
+                    rejected_irrelevant_sources_list.append({
+                        "url": item["url"],
+                        "title": res.title,
+                        "source_type": item["rel"].source_type,
+                        "is_hard_excluded": False,
+                        "reason": audit_reason,
+                    })
                     source = ResearchSource(
                         research_run_id=run.id,
                         title=res.title,
-                        url=norm_url,
+                        url=item["url"],
                         publisher=res.publisher,
                         published_at=res.published_at,
-                        source_type=rel_result.source_type,
+                        source_type=item["rel"].source_type,
                         credibility_score=res.credibility_score,
                         metadata_json={
-                            "query": query_str,
+                            "query": item["query"],
                             "provider": "ddgs",
                             "relevance": {
-                                "score": rel_result.relevance_score,
-                                "title_match": rel_result.title_match,
-                                "snippet_match": rel_result.snippet_match,
-                                "concept_match": rel_result.concept_match,
-                                "domain_quality": rel_result.domain_quality,
-                                "source_role": rel_result.source_role,
+                                "score": item["rel"].relevance_score,
+                                "source_role": item["rel"].source_role,
                             },
-                            "source_role": rel_result.source_role,
-                            "lifecycle_state": "ELIGIBLE",
+                            "rejection_reason": audit_reason,
+                            "lifecycle_state": "REJECTED",
                             "is_evidence_eligible": False,
                         },
                     )
                     self.session.add(source)
-                    relevant_sources_data.append({"source": source, "rel": rel_result})
+
+            # 5. Stage 2B: Batched Semantic Relevance Validation per sub-question
+            relevant_sources_data: List[dict] = []
+
+            # Group diversity-accepted candidates by sub-question
+            accepted_by_sub_q: Dict[ResearchSubQuestion, List[dict]] = {}
+            for item in diversity_accepted_candidates:
+                accepted_by_sub_q.setdefault(item["sub_q"], []).append(item)
+
+            for sub_q_obj, sub_q_items in accepted_by_sub_q.items():
+                # Format payload for batched evaluation
+                candidate_payloads = [
+                    {
+                        "url": item["url"],
+                        "title": item["res"].title,
+                        "snippet": item["res"].snippet,
+                        "candidate_score": item["candidate_score"],
+                        "matched_concepts": item["matched_concepts"],
+                    }
+                    for item in sub_q_items
+                ]
+
+                semantic_eval_results = await self.ai_provider.evaluate_sources_relevance_batch(
+                    sub_question=sub_q_obj.question,
+                    candidate_sources=candidate_payloads,
+                )
+                eval_by_url = {e.url: e for e in semantic_eval_results}
+
+                for item in sub_q_items:
+                    res = item["res"]
+                    canonical_url = item["url"]
+                    eval_item = eval_by_url.get(canonical_url)
+
+                    is_sem_relevant = eval_item.is_relevant if eval_item else True
+                    sem_score = eval_item.relevance_score if eval_item else item["candidate_score"]
+
+                    if is_sem_relevant and sem_score >= settings.MIN_SOURCE_RELEVANCE_SCORE:
+                        semantically_relevant_count += 1
+                        source = ResearchSource(
+                            research_run_id=run.id,
+                            title=res.title,
+                            url=canonical_url,
+                            publisher=res.publisher,
+                            published_at=res.published_at,
+                            source_type=item["rel"].source_type,
+                            credibility_score=res.credibility_score,
+                            metadata_json={
+                                "query": item["query"],
+                                "provider": "ddgs",
+                                "relevance": {
+                                    "score": sem_score,
+                                    "candidate_score": item["candidate_score"],
+                                    "title_match": item["rel"].title_match,
+                                    "snippet_match": item["rel"].snippet_match,
+                                    "concept_match": item["rel"].concept_match,
+                                    "domain_quality": item["rel"].domain_quality,
+                                    "source_role": item["rel"].source_role,
+                                    "semantic_reason": eval_item.reason if eval_item else "Validated candidate",
+                                    "matched_concepts": eval_item.matched_concepts if eval_item else item["matched_concepts"],
+                                },
+                                "source_role": item["rel"].source_role,
+                                "lifecycle_state": "ELIGIBLE",
+                                "is_evidence_eligible": False,
+                            },
+                        )
+                        self.session.add(source)
+                        relevant_sources_data.append({"source": source, "rel": item["rel"]})
+                    else:
+                        rejected_irrelevant_count += 1
+                        rejection_reason = "SEMANTIC_RELEVANCE_MISMATCH"
+                        rejected_irrelevant_sources_list.append({
+                            "url": canonical_url,
+                            "title": res.title,
+                            "source_type": item["rel"].source_type,
+                            "is_hard_excluded": False,
+                            "reason": rejection_reason,
+                        })
+                        source = ResearchSource(
+                            research_run_id=run.id,
+                            title=res.title,
+                            url=canonical_url,
+                            publisher=res.publisher,
+                            published_at=res.published_at,
+                            source_type=item["rel"].source_type,
+                            credibility_score=res.credibility_score,
+                            metadata_json={
+                                "query": item["query"],
+                                "provider": "ddgs",
+                                "relevance": {
+                                    "score": sem_score,
+                                    "candidate_score": item["candidate_score"],
+                                },
+                                "rejection_reason": rejection_reason,
+                                "lifecycle_state": "REJECTED",
+                                "is_evidence_eligible": False,
+                            },
+                        )
+                        self.session.add(source)
 
             await self.session.flush()
             timing["search_seconds"] = round(time.time() - t0, 2)
             logger.info(
                 f"[stage2_complete] run_id={run_id} queries={len(query_plan)} "
-                f"discovered={discovered_count} relevant={relevant_count} "
+                f"discovered={discovered_count} candidates={candidate_count} "
+                f"semantically_relevant={semantically_relevant_count} "
                 f"rejected={rejected_irrelevant_count} search_time={timing['search_seconds']}s"
             )
 
@@ -693,9 +819,10 @@ class ResearchPipelineService:
             total_duration = round(time.time() - pipeline_start, 2)
             timing["total_seconds"] = total_duration
 
+            relevant_count = semantically_relevant_count
             quality_metrics = calculate_research_quality_metrics(
                 discovered_sources_count=discovered_count,
-                relevant_sources_count=relevant_count,
+                relevant_sources_count=semantically_relevant_count,
                 rejected_irrelevant_count=rejected_irrelevant_count,
                 fetch_success_count=fetch_success_count,
                 failed_sources_count=failed_sources_count,
@@ -737,11 +864,15 @@ class ResearchPipelineService:
                 "findings_before_deduplication": findings_before_deduplication,
                 "findings_after_deduplication": grounded_findings_count,
                 "duplicate_findings_merged": duplicate_findings_merged,
-                # Source lifecycle & auditability lists
+                # Source lifecycle & auditability lists (Two-Stage Metrics)
                 "discovered_sources": discovered_count,
                 "discovered_sources_count": discovered_count,
-                "relevant_sources": relevant_count,
-                "relevant_sources_count": relevant_count,
+                "deterministic_candidates": candidate_count,
+                "deterministic_candidates_count": candidate_count,
+                "semantically_relevant_sources": semantically_relevant_count,
+                "semantically_relevant_sources_count": semantically_relevant_count,
+                "relevant_sources": semantically_relevant_count,
+                "relevant_sources_count": semantically_relevant_count,
                 "rejected_irrelevant_sources": rejected_irrelevant_sources_list,
                 "rejected_irrelevant_count": rejected_irrelevant_count,
                 "successful_sources": successful_sources_list,
@@ -749,17 +880,26 @@ class ResearchPipelineService:
                 "failed_sources": failed_sources_list,
                 "failed_sources_count": failed_sources_count,
                 "evidence_eligible_count": evidence_eligible_count,
-                # Findings & evidence
+                "source_diversity": {
+                    "unique_domains_count": len(seen_titles_by_domain),
+                    "max_sources_per_domain": settings.MAX_SOURCES_PER_DOMAIN,
+                    "source_types": dict(source_type_counter),
+                },
+                # Findings & evidence metrics
                 "finding_count": grounded_findings_count,
                 "findings_count": grounded_findings_count,
+                "findings_generated": grounded_findings_count,
                 "grounded_findings_count": grounded_findings_count,
                 "unsupported_findings_count": unsupported_findings_count,
+                "rejected_findings": unsupported_findings_count,
                 "evidence_count": total_evidence_count,
+                "evidence_generated": total_evidence_count,
                 "contradiction_count": len(persisted_contradictions),
                 "contradictions_count": len(persisted_contradictions),
                 "contradictions_by_category": dict(contradiction_cat_counter),
                 "conclusions_count": len(persisted_conclusions),
                 "duration_seconds": total_duration,
+                "total_runtime": total_duration,
                 "constraint_preservation": constraint_meta,
                 "warnings": warnings_list,
                 "quality_metrics": quality_metrics,
