@@ -1,0 +1,72 @@
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import "tailwindcss";
+
+:root {
+  --color-primary: #EA580C;
+  --color-primary-hover: #C2410C;
+  --color-accent: #FDBA74;
+  --color-bg-dark: #12151A;
+  --color-surface: #191C21;
+  --color-surface-hover: #22262D;
+  --color-border: #262A33;
+  --color-border-bright: #363C4A;
+  --font-geist: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  
+  font-family: var(--font-geist);
+  line-height: 1.5;
+  font-weight: 400;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: #12151A;
+  color: #F9FAFB;
+  font-family: var(--font-geist);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbars for technical console */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #12151A;
+}
+::-webkit-scrollbar-thumb {
+  background: #262A33;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #363C4A;
+}
+
+/* Restrained entrance animation */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Technical grid background pattern */
+.bg-tech-grid {
+  background-size: 32px 32px;
+  background-image: 
+    linear-gradient(to right, rgba(38, 42, 51, 0.3) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(38, 42, 51, 0.3) 1px, transparent 1px);
+}
