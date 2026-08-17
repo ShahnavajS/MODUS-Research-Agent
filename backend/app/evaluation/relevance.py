@@ -273,7 +273,7 @@ def evaluate_source_relevance(
     query: str,
     sub_question: str = "",
     research_question: str = "",
-    min_score: float = 0.35,
+    min_score: float = 0.20,
 ) -> SourceRelevanceResult:
     """
     Deterministic source relevance evaluation.

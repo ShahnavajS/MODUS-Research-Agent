@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     MAX_DOCUMENT_SIZE_BYTES: int = 500_000
 
     # Source Relevance & Filtering
-    MIN_SOURCE_RELEVANCE_SCORE: float = 0.35
+    MIN_SOURCE_RELEVANCE_SCORE: float = 0.20
     MIN_CONTENT_WORD_COUNT: int = 30
 
     # Performance & Concurrency
