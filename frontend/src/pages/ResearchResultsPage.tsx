@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../services/api';
 import type { ResearchRunDetail } from '../types';
+import { formatLocalDateTime, formatRelativeTime } from '../utils/date';
 import { MetricCard } from '../components/common/MetricCard';
 import { ConclusionPanel } from '../components/research/ConclusionPanel';
 import { FindingCard } from '../components/research/FindingCard';
@@ -84,7 +85,7 @@ export const ResearchResultsPage: React.FC<ResearchResultsPageProps> = ({ runId,
               </span>
             </div>
             <span className="text-[11px] text-[#9CA3AF]">
-              Completed {detail.completed_at ? new Date(detail.completed_at).toLocaleString() : ''}
+              Completed {detail.completed_at ? `${formatRelativeTime(detail.completed_at)} (${formatLocalDateTime(detail.completed_at)})` : ''}
             </span>
           </div>
 

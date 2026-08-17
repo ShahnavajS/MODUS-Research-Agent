@@ -12,6 +12,7 @@ import { CreateProjectModal } from '../components/CreateProjectModal';
 import { EditProjectModal } from '../components/EditProjectModal';
 import { EditQuestionModal } from '../components/EditQuestionModal';
 import { DeleteConfirmModal } from '../components/DeleteConfirmModal';
+import { parseUtcDate, formatLocalDateTime, formatLocalDate, formatRelativeTime } from '../utils/date';
 
 interface ResearchHistoryPageProps {
   onViewRunResults: (runId: string) => void;
@@ -20,12 +21,14 @@ interface ResearchHistoryPageProps {
 interface QuestionWithRuns {
   question: ResearchQuestion;
   runs: ResearchRun[];
+  latestActivityTimestamp: number;
 }
 
 interface WorkspaceHierarchy {
   project: ResearchProject;
   questions: QuestionWithRuns[];
   totalRuns: number;
+  latestActivityTimestamp: number;
 }
 
 export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
@@ -86,50 +89,84 @@ export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
             const questions = await api.listQuestions(project.id);
             const questionsWithRuns: QuestionWithRuns[] = [];
             let projRunCount = 0;
+            const projectCreatedTime = parseUtcDate(project.created_at).getTime();
+            let latestWorkspaceTime = projectCreatedTime;
 
             await Promise.all(
               questions.map(async (q) => {
                 try {
                   const runs = await api.listRuns(q.id);
-                  // Sort runs newest first
-                  runs.sort(
-                    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-                  );
+                  // Sort runs newest first by UTC timestamp
+                  runs.sort((a, b) => {
+                    const timeA = parseUtcDate(a.completed_at || a.created_at).getTime();
+                    const timeB = parseUtcDate(b.completed_at || b.created_at).getTime();
+                    return timeB - timeA;
+                  });
+
                   projRunCount += runs.length;
-                  questionsWithRuns.push({ question: q, runs });
+
+                  // Find latest activity for this question
+                  const qCreatedTime = parseUtcDate(q.created_at).getTime();
+                  const latestRunTime =
+                    runs.length > 0
+                      ? parseUtcDate(runs[0].completed_at || runs[0].created_at).getTime()
+                      : qCreatedTime;
+                  const latestQuestionTime = Math.max(qCreatedTime, latestRunTime);
+
+                  latestWorkspaceTime = Math.max(latestWorkspaceTime, latestQuestionTime);
+
+                  questionsWithRuns.push({
+                    question: q,
+                    runs,
+                    latestActivityTimestamp: latestQuestionTime,
+                  });
                 } catch {
-                  questionsWithRuns.push({ question: q, runs: [] });
+                  const qCreatedTime = parseUtcDate(q.created_at).getTime();
+                  latestWorkspaceTime = Math.max(latestWorkspaceTime, qCreatedTime);
+                  questionsWithRuns.push({
+                    question: q,
+                    runs: [],
+                    latestActivityTimestamp: qCreatedTime,
+                  });
                 }
               })
             );
 
-            // Sort questions newest first
+            // Sort questions newest activity first
             questionsWithRuns.sort(
-              (a, b) =>
-                new Date(b.question.created_at).getTime() -
-                new Date(a.question.created_at).getTime()
+              (a, b) => b.latestActivityTimestamp - a.latestActivityTimestamp
             );
 
             hierarchy.push({
               project,
               questions: questionsWithRuns,
               totalRuns: projRunCount,
+              latestActivityTimestamp: latestWorkspaceTime,
             });
           } catch {
+            const projectCreatedTime = parseUtcDate(project.created_at).getTime();
             hierarchy.push({
               project,
               questions: [],
               totalRuns: 0,
+              latestActivityTimestamp: projectCreatedTime,
             });
           }
         })
       );
 
-      // Sort workspaces newest first
-      hierarchy.sort(
-        (a, b) =>
-          new Date(b.project.created_at).getTime() - new Date(a.project.created_at).getTime()
-      );
+      // Sort workspaces newest activity first (latest research run workspace at the top!)
+      hierarchy.sort((a, b) => b.latestActivityTimestamp - a.latestActivityTimestamp);
+
+      // Automatically expand the most recent active workspace if none expanded yet
+      if (hierarchy.length > 0) {
+        setExpandedWorkspaces((prev) => {
+          if (Object.keys(prev).length === 0) {
+            return { [hierarchy[0].project.id]: true };
+          }
+          return prev;
+        });
+      }
 
       setWorkspaces(hierarchy);
       setError(null);
@@ -275,7 +312,7 @@ export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
             Traceability Audit History
           </h1>
           <p className="text-[#9CA3AF] text-xs font-sans mt-0.5">
-            Hierarchical audit history organized by workspace entities, inquiry questions, and execution runs.
+            Hierarchical audit history organized by workspace entities, inquiry questions, and execution runs (most recent research first).
           </p>
         </div>
 
@@ -343,7 +380,7 @@ export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
         </div>
       ) : (
         <div className="space-y-4">
-          {filteredWorkspaces.map(({ project, questions, totalRuns }) => {
+          {filteredWorkspaces.map(({ project, questions, totalRuns, latestActivityTimestamp }) => {
             const isExpanded = !!expandedWorkspaces[project.id];
             return (
               <div
@@ -374,6 +411,10 @@ export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
                         <span className="text-[#6B7280]">•</span>
                         <span className="text-[#FDBA74] font-semibold">
                           Topic: {project.research_topic}
+                        </span>
+                        <span className="text-[#6B7280]">•</span>
+                        <span className="text-[#9CA3AF] text-[10px]">
+                          Last activity: {formatRelativeTime(latestActivityTimestamp)}
                         </span>
                       </div>
 
@@ -489,7 +530,9 @@ export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
                                 <div className="flex items-center gap-2 text-[10px] text-[#9CA3AF]">
                                   <span className="text-[#10B981] font-semibold uppercase">{q.status}</span>
                                   <span>•</span>
-                                  <span>Created {new Date(q.created_at).toLocaleDateString()}</span>
+                                  <span title={formatLocalDateTime(q.created_at)}>
+                                    Created {formatRelativeTime(q.created_at)} ({formatLocalDate(q.created_at)})
+                                  </span>
                                 </div>
                                 <h3 className="text-sm font-bold text-white font-sans leading-snug">
                                   {q.question}
@@ -524,82 +567,88 @@ export const ResearchHistoryPage: React.FC<ResearchHistoryPageProps> = ({
                                 <p className="text-[11px] text-[#6B7280] italic">No execution runs for this question yet.</p>
                               ) : (
                                 <div className="space-y-2">
-                                  {runs.map((r) => (
-                                    <div
-                                      key={r.id}
-                                      className="bg-[#12151A] border border-[#262A33] rounded p-3 space-y-2"
-                                    >
-                                      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                                        <div className="flex items-center gap-2">
-                                          <span className="text-[#F9FAFB] font-semibold">
-                                            RUN {r.id.substring(0, 8)}
-                                          </span>
-                                          <span
-                                            className={`px-2 py-0.5 rounded text-[9px] uppercase font-bold tracking-wider ${
-                                              r.status === 'completed'
-                                                ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/25'
-                                                : r.status === 'running'
-                                                ? 'bg-[#F59E0B]/10 text-[#F59E0B] border border-[#F59E0B]/25'
-                                                : 'bg-[#EF4444]/10 text-[#EF4444] border border-[#EF4444]/25'
-                                            }`}
-                                          >
-                                            {r.status}
-                                          </span>
-                                          <span className="text-[10px] text-[#9CA3AF]">
-                                            {new Date(r.created_at).toLocaleString()}
-                                          </span>
-                                        </div>
-
-                                        <div className="flex items-center gap-2">
-                                          {r.status === 'completed' && (
-                                            <button
-                                              onClick={() => onViewRunResults(r.id)}
-                                              className="px-3 py-1 bg-[#EA580C] hover:bg-[#C2410C] text-white rounded font-semibold text-[11px] transition-colors whitespace-nowrap shadow-sm cursor-pointer"
+                                  {runs.map((r) => {
+                                    const runTime = r.completed_at || r.created_at;
+                                    return (
+                                      <div
+                                        key={r.id}
+                                        className="bg-[#12151A] border border-[#262A33] rounded p-3 space-y-2"
+                                      >
+                                        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                                          <div className="flex items-center gap-2">
+                                            <span className="text-[#F9FAFB] font-semibold">
+                                              RUN {r.id.substring(0, 8)}
+                                            </span>
+                                            <span
+                                              className={`px-2 py-0.5 rounded text-[9px] uppercase font-bold tracking-wider ${
+                                                r.status === 'completed'
+                                                  ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/25'
+                                                  : r.status === 'running'
+                                                  ? 'bg-[#F59E0B]/10 text-[#F59E0B] border border-[#F59E0B]/25'
+                                                  : 'bg-[#EF4444]/10 text-[#EF4444] border border-[#EF4444]/25'
+                                              }`}
                                             >
-                                              View Results →
-                                            </button>
-                                          )}
-                                          <button
-                                            title="Delete Run"
-                                            onClick={() => handleDeleteRun(r.id)}
-                                            className="px-2 py-1 text-[#9CA3AF] hover:text-[#EF4444] transition-colors cursor-pointer text-xs"
-                                          >
-                                            🗑️
-                                          </button>
-                                        </div>
-                                      </div>
+                                              {r.status}
+                                            </span>
+                                            <span
+                                              className="text-[10px] text-[#9CA3AF]"
+                                              title={`Local: ${formatLocalDateTime(runTime)}`}
+                                            >
+                                              {formatRelativeTime(runTime)} • {formatLocalDateTime(runTime)}
+                                            </span>
+                                          </div>
 
-                                      {/* Metrics row */}
-                                      {r.counts && (
-                                        <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5 bg-[#191C21] p-1.5 rounded border border-[#262A33] text-center text-[9px]">
-                                          <div>
-                                            <span className="text-[#9CA3AF] block">Sub-Q</span>
-                                            <span className="text-[#F9FAFB] font-bold">{r.counts.sub_questions}</span>
-                                          </div>
-                                          <div>
-                                            <span className="text-[#9CA3AF] block">Sources</span>
-                                            <span className="text-[#06B6D4] font-bold">{r.counts.sources}</span>
-                                          </div>
-                                          <div>
-                                            <span className="text-[#9CA3AF] block">Findings</span>
-                                            <span className="text-[#FDBA74] font-bold">{r.counts.findings}</span>
-                                          </div>
-                                          <div>
-                                            <span className="text-[#9CA3AF] block">Evidence</span>
-                                            <span className="text-[#10B981] font-bold">{r.counts.evidence}</span>
-                                          </div>
-                                          <div>
-                                            <span className="text-[#9CA3AF] block">Conflicts</span>
-                                            <span className="text-[#F59E0B] font-bold">{r.counts.contradictions}</span>
-                                          </div>
-                                          <div>
-                                            <span className="text-[#9CA3AF] block">Conclusion</span>
-                                            <span className="text-[#EA580C] font-bold">{r.counts.conclusions}</span>
+                                          <div className="flex items-center gap-2">
+                                            {r.status === 'completed' && (
+                                              <button
+                                                onClick={() => onViewRunResults(r.id)}
+                                                className="px-3 py-1 bg-[#EA580C] hover:bg-[#C2410C] text-white rounded font-semibold text-[11px] transition-colors whitespace-nowrap shadow-sm cursor-pointer"
+                                              >
+                                                View Results →
+                                              </button>
+                                            )}
+                                            <button
+                                              title="Delete Run"
+                                              onClick={() => handleDeleteRun(r.id)}
+                                              className="px-2 py-1 text-[#9CA3AF] hover:text-[#EF4444] transition-colors cursor-pointer text-xs"
+                                            >
+                                              🗑️
+                                            </button>
                                           </div>
                                         </div>
-                                      )}
-                                    </div>
-                                  ))}
+
+                                        {/* Metrics row */}
+                                        {r.counts && (
+                                          <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5 bg-[#191C21] p-1.5 rounded border border-[#262A33] text-center text-[9px]">
+                                            <div>
+                                              <span className="text-[#9CA3AF] block">Sub-Q</span>
+                                              <span className="text-[#F9FAFB] font-bold">{r.counts.sub_questions}</span>
+                                            </div>
+                                            <div>
+                                              <span className="text-[#9CA3AF] block">Sources</span>
+                                              <span className="text-[#06B6D4] font-bold">{r.counts.sources}</span>
+                                            </div>
+                                            <div>
+                                              <span className="text-[#9CA3AF] block">Findings</span>
+                                              <span className="text-[#FDBA74] font-bold">{r.counts.findings}</span>
+                                            </div>
+                                            <div>
+                                              <span className="text-[#9CA3AF] block">Evidence</span>
+                                              <span className="text-[#10B981] font-bold">{r.counts.evidence}</span>
+                                            </div>
+                                            <div>
+                                              <span className="text-[#9CA3AF] block">Conflicts</span>
+                                              <span className="text-[#F59E0B] font-bold">{r.counts.contradictions}</span>
+                                            </div>
+                                            <div>
+                                              <span className="text-[#9CA3AF] block">Conclusion</span>
+                                              <span className="text-[#EA580C] font-bold">{r.counts.conclusions}</span>
+                                            </div>
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
                                 </div>
                               )}
                             </div>

@@ -1,5 +1,6 @@
 import React from 'react';
 import type { Conclusion } from '../../types';
+import { formatLocalTime } from '../../utils/date';
 
 interface ConclusionPanelProps {
   conclusions: Conclusion[];
@@ -54,7 +55,7 @@ export const ConclusionPanel: React.FC<ConclusionPanelProps> = ({ conclusions })
                 <span className="text-[#EA580C] font-semibold">
                   Backed by {conc.finding_ids?.length || 0} Traceable Findings
                 </span>
-                <span>Generated {new Date(conc.created_at).toLocaleTimeString()}</span>
+                <span>Generated {formatLocalTime(conc.created_at)}</span>
               </div>
             </div>
           );

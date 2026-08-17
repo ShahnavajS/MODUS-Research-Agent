@@ -22,9 +22,8 @@ from app.models.base import Base
 async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("Initializing MODUS Enterprise Research Intelligence Platform API...")
-    if settings.DATABASE_URL.startswith("sqlite"):
-        async with async_engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    async with async_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
     yield
     logger.info("Shutting down API server...")
 

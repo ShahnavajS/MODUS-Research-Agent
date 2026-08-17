@@ -93,15 +93,8 @@ def generate_focused_queries(sub_question: str, max_queries: int = 2) -> List[st
 
     # Extract content words for a variant query
     words = re.findall(r"[a-z0-9]+(?:[-][a-z0-9]+)*", base_query.lower())
-    stop_words = {
-        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-        "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "can", "it", "its", "this", "that",
-        "what", "which", "who", "how", "when", "where", "why",
-        "not", "no", "so", "if", "than", "too", "very", "just", "about",
-    }
-    key_terms = [w for w in words if w not in stop_words and len(w) > 2]
+    from app.core.utils import STOP_WORDS
+    key_terms = [w for w in words if w not in STOP_WORDS and len(w) > 2]
 
     if len(key_terms) >= 4:
         # Create a variant query using a subset of key terms + "analysis" or "report"

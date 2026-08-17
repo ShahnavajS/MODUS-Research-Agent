@@ -8,16 +8,7 @@ Preserves all evidence links and traces provenance of merged findings.
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-
-_STOP_WORDS: Set[str] = {
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-    "being", "have", "has", "had", "do", "does", "did", "will", "would",
-    "could", "should", "may", "might", "shall", "can", "it", "its", "this",
-    "that", "these", "those", "also", "furthermore", "moreover", "however",
-    "such", "as", "into", "through", "during", "before", "after", "about",
-    "can", "could", "often", "typically", "primarily", "largely",
-}
+from app.core.utils import STOP_WORDS as _STOP_WORDS
 
 _NUMERIC_PATTERN = re.compile(
     r"(?:\$\s*[\d,.]+(?:\s*(?:billion|million|trillion|k|m|b))?|\b\d+(?:[.,]\d+)?\s*(?:%|percent|x|months?|years?|weeks?|days?|hours?|bps)?|\b\d+:\d+(?:\s*to\s*\d+:\d+)?|\b\d+\s*-\s*\d+\s*(?:%|percent)?)",
@@ -131,7 +122,7 @@ class CanonicalFindingGroup:
 
 def deduplicate_findings(
     finding_candidates: List[Dict[str, Any]],
-    similarity_threshold: float = 0.50,
+    similarity_threshold: float = 0.55,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Deduplicate a list of finding dicts/candidates into canonical findings.

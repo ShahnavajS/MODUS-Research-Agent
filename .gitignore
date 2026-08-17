@@ -100,5 +100,6 @@ desktop.ini
 .gemini/
 *.log
 live_microfix_summary.json
+live_refactor_validation_summary.json
 test_results*.json
 benchmark_*.json

@@ -11,7 +11,16 @@ import type {
   RunTraceability,
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+function getApiBaseUrl(): string {
+  let url = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1').trim();
+  url = url.replace(/\/+$/, '');
+  if (!url.endsWith('/api/v1')) {
+    url = `${url}/api/v1`;
+  }
+  return url;
+}
+
+const API_BASE_URL = getApiBaseUrl();
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {

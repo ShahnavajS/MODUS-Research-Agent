@@ -1,6 +1,7 @@
 """
-Strengthened URL normalization with tracking parameter stripping,
-fragment removal, and near-duplicate detection.
+Core utilities: URL normalization, near-duplicate detection, and shared constants.
+
+This is the SINGLE canonical URL normalizer for the entire pipeline.
 """
 import re
 import urllib.parse
@@ -8,47 +9,80 @@ from difflib import SequenceMatcher
 from typing import Set
 
 
-# Common tracking / analytics URL parameters to strip
-_TRACKING_PARAMS: Set[str] = {
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "ref", "s", "fbclid", "gclid", "gclsrc", "dclid", "msclkid",
-    "mc_cid", "mc_eid", "yclid", "twclid",
-    "_ga", "_gl", "source", "campaign",
-    "share", "action", "context", "si",
+# ─── Shared English Stop Words (single canonical definition) ─────────────────
+
+STOP_WORDS: Set[str] = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "shall", "can", "it", "its", "this",
+    "that", "these", "those", "i", "you", "he", "she", "we", "they", "my",
+    "your", "his", "her", "our", "their", "me", "him", "us", "them",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "not", "no", "nor", "so", "if", "then", "than", "too", "very",
+    "just", "about", "also", "more", "most", "some", "any", "each",
+    "all", "both", "few", "other", "such", "only", "own",
+    "up", "out", "off", "over", "under", "again", "further",
+    "there", "here", "as", "into", "through", "during", "before", "after",
+    "above", "below", "between", "same", "because",
+    "furthermore", "moreover", "however", "often", "typically",
+    "primarily", "largely",
+}
+
+
+# ─── Tracking Parameters to Strip ────────────────────────────────────────────
+
+_TRACKING_PARAM_PREFIXES = ("utm_", "ga_", "mc_", "_hs", "pk_")
+_TRACKING_PARAM_EXACT: Set[str] = {
+    "ref", "ref_src", "fbclid", "gclid", "msclkid", "twclid", "igshid",
+    "spm", "from_source", "feature", "source", "share", "ncid", "ocid",
+    "session_id", "client_id", "s_kwcid", "dclid", "zanpid", "yclid",
+    "s", "campaign", "action", "context", "si",
+    "_ga", "_gl",
 }
 
 
 def normalize_url(url: str) -> str:
     """
-    Normalizes a URL to prevent duplicate source acquisition within a research run.
+    Canonical URL normalization for the entire pipeline.
     - Lowercases scheme and netloc
-    - Strips trailing slashes
-    - Strips fragment (#...)
-    - Strips tracking query parameters (utm_*, fbclid, gclid, etc.)
-    - Preserves meaningful query parameters
+    - Removes default ports (:80, :443)
+    - Strips tracking/analytics query parameters
+    - Strips URL fragments
+    - Strips trailing slash
     """
-    if not url:
+    if not url or not isinstance(url, str):
         return ""
     try:
         parsed = urllib.parse.urlparse(url.strip())
-        scheme = parsed.scheme.lower()
+        scheme = parsed.scheme.lower() or "https"
         netloc = parsed.netloc.lower()
-        path = parsed.path.rstrip("/")
 
-        # Filter query parameters: keep only non-tracking params
+        # Remove default port
+        if netloc.endswith(":80"):
+            netloc = netloc[:-3]
+        elif netloc.endswith(":443"):
+            netloc = netloc[:-4]
+
+        # Strip tracking query parameters
+        clean_params = {}
         if parsed.query:
-            params = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
-            filtered = {
-                k: v for k, v in params.items()
-                if k.lower() not in _TRACKING_PARAMS
-            }
-            clean_query = urllib.parse.urlencode(filtered, doseq=True) if filtered else ""
-        else:
-            clean_query = ""
+            query_dict = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+            for k, v in query_dict.items():
+                k_lower = k.lower()
+                if k_lower in _TRACKING_PARAM_EXACT:
+                    continue
+                if any(k_lower.startswith(p) for p in _TRACKING_PARAM_PREFIXES):
+                    continue
+                clean_params[k] = v[0] if len(v) == 1 else v
 
-        # Reconstruct without fragment
-        normalized = urllib.parse.urlunparse((scheme, netloc, path, parsed.params, clean_query, ""))
-        return normalized
+        clean_query = urllib.parse.urlencode(clean_params, doseq=True) if clean_params else ""
+
+        # Normalize path
+        path = (parsed.path or "").rstrip("/")
+
+        canonical = urllib.parse.urlunparse((scheme, netloc, path, parsed.params, clean_query, ""))
+        return canonical
     except Exception:
         return url.strip().rstrip("/")
 
@@ -61,8 +95,6 @@ def is_near_duplicate(title_a: str, domain_a: str, title_b: str, domain_b: str, 
     if not domain_a or not domain_b:
         return False
     if domain_a.lower() != domain_b.lower():
-        return False  # Different domains — not duplicates
-    
-    # Same domain: compare titles
+        return False
     ratio = SequenceMatcher(None, title_a.lower().strip(), title_b.lower().strip()).ratio()
     return ratio >= threshold

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../services/api';
 import type { ResearchProject, CreateProjectPayload } from '../types';
 import { CreateProjectModal } from '../components/CreateProjectModal';
+import { formatLocalDate, formatRelativeTime } from '../utils/date';
 
 interface DashboardPageProps {
   onSelectProject: (projectId: string) => void;
@@ -183,7 +184,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
               </div>
 
               <div className="pt-3 border-t border-[#262A33] flex items-center justify-between text-xs text-[#9CA3AF] font-mono">
-                <span>Created {new Date(project.created_at).toLocaleDateString()}</span>
+                <span>Created {formatRelativeTime(project.created_at)} ({formatLocalDate(project.created_at)})</span>
                 <span className="text-[#EA580C] font-semibold group-hover:translate-x-0.5 transition-transform">
                   Questions →
                 </span>

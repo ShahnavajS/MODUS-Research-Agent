@@ -14,7 +14,7 @@ from app.core.config import settings
 # Force mock providers for fast, isolated, deterministic unit testing
 settings.AI_PROVIDER = "mock"
 settings.RESEARCH_PROVIDER = "mock"
-settings.MIN_SOURCE_RELEVANCE_SCORE = 0.35
+settings.MAX_SELECTED_SOURCES = 12
 
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 

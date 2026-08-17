@@ -10,6 +10,7 @@ import type {
 import { EditProjectModal } from '../components/EditProjectModal';
 import { EditQuestionModal } from '../components/EditQuestionModal';
 import { DeleteConfirmModal } from '../components/DeleteConfirmModal';
+import { formatLocalDate, formatRelativeTime } from '../utils/date';
 
 interface ProjectDetailPageProps {
   projectId: string;
@@ -310,7 +311,7 @@ export const ProjectDetailPage: React.FC<ProjectDetailPageProps> = ({
                   <div className="space-y-1">
                     <h3 className="text-base font-bold text-white font-sans leading-snug">{q.question}</h3>
                     <p className="text-[11px] text-[#9CA3AF]">
-                      Created {new Date(q.created_at).toLocaleString()}
+                      Created {formatRelativeTime(q.created_at)} ({formatLocalDate(q.created_at)})
                     </p>
                   </div>
 

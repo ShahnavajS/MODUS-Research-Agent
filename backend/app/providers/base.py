@@ -50,40 +50,12 @@ class ConclusionCandidate(BaseModel):
     limitations: Optional[str] = Field(None, description="Scope limitations or uncertainty notes")
 
 
-class SemanticRelevanceItem(BaseModel):
-    url: str = Field(..., description="Canonical source URL")
-    is_relevant: bool = Field(True, description="Whether source is semantically relevant")
-    relevance_score: float = Field(0.80, description="Relevance score between 0.0 and 1.0")
-    matched_concepts: List[str] = Field(default_factory=list, description="List of matched concepts")
-    reason: str = Field("", description="Explainable reason for relevance decision")
-
-
 class AIProvider(ABC):
     """
     Abstract Base Class for AI Intelligence Providers.
     Defines structured operations for question decomposition, finding extraction,
     evidence linkage, contradiction detection, and conclusion generation.
     """
-
-    async def evaluate_sources_relevance_batch(
-        self, sub_question: str, candidate_sources: List[Dict[str, Any]]
-    ) -> List[SemanticRelevanceItem]:
-        """
-        Stage 2B: Evaluate semantic relevance of candidate search results against sub-question.
-        Default implementation returns all candidates as valid.
-        """
-        results = []
-        for src in candidate_sources:
-            results.append(
-                SemanticRelevanceItem(
-                    url=src.get("url", ""),
-                    is_relevant=True,
-                    relevance_score=src.get("candidate_score", 0.70),
-                    matched_concepts=src.get("matched_concepts", []),
-                    reason="Validated by candidate match",
-                )
-            )
-        return results
 
     @abstractmethod
     async def decompose_question(self, question: str) -> List[SubQuestionCandidate]:
@@ -101,7 +73,6 @@ class AIProvider(ABC):
         self, sources: List[SourceDocumentInput], research_question: str
     ) -> List[FindingCandidate]:
         """Extract structured findings from a batch of verified source documents."""
-        # Default fallback: iterate over sources
         all_findings = []
         for s in sources:
             findings = await self.extract_findings_and_evidence(

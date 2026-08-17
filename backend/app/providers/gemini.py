@@ -4,7 +4,7 @@ Production Gemini AI Intelligence Provider.
 Uses Google's official `google-genai` SDK with structured output (Pydantic schemas)
 to guarantee validated model output for:
   - Question decomposition
-  - Finding extraction (batched & single with strict source attribution)
+  - Finding extraction (batched with strict source attribution and per-source cap)
   - Contradiction detection
   - Conclusion synthesis
 """
@@ -28,7 +28,6 @@ from app.providers.base import (
     ConclusionCandidate,
     ContradictionCandidate,
     FindingCandidate,
-    SemanticRelevanceItem,
     SourceDocumentInput,
     SubQuestionCandidate,
 )
@@ -36,18 +35,7 @@ from app.providers.base import (
 logger = logging.getLogger(__name__)
 
 
-# Structured Wrapper Pydantic Schemas for Gemini Structured JSON Output
-class SemanticRelevanceItemResponse(BaseModel):
-    url: str = Field(..., description="Canonical source URL")
-    is_relevant: bool = Field(..., description="Whether this search candidate directly provides evidence for the sub-question")
-    relevance_score: float = Field(0.80, description="Semantic relevance score 0.0 to 1.0")
-    matched_concepts: List[str] = Field(default_factory=list, description="Key concepts or topics from the question addressed by this source")
-    reason: str = Field(..., description="Brief explainable justification for relevance")
-
-
-class SemanticRelevanceBatchResponse(BaseModel):
-    evaluations: List[SemanticRelevanceItemResponse]
-
+# ─── Structured Response Schemas ─────────────────────────────────────────────
 
 class SubQuestionListResponse(BaseModel):
     sub_questions: List[SubQuestionCandidate]
@@ -65,89 +53,13 @@ class ConclusionListResponse(BaseModel):
     conclusions: List[ConclusionCandidate]
 
 
+# ─── Gemini AI Provider ─────────────────────────────────────────────────────
+
 class GeminiAIProvider(AIProvider):
     """
-    Production Gemini AI Intelligence Provider using Google's official `google-genai` SDK.
-    Uses structured output (Pydantic schemas) to guarantee validated model output.
-    All synchronous SDK network calls are dispatched via asyncio.to_thread for true non-blocking concurrency.
+    Production Gemini AI Provider using structured JSON output.
+    All synchronous SDK calls are dispatched via asyncio.to_thread.
     """
-
-    async def evaluate_sources_relevance_batch(
-        self, sub_question: str, candidate_sources: List[Dict[str, Any]]
-    ) -> List[SemanticRelevanceItem]:
-        """
-        Stage 2B: Evaluate semantic relevance of candidates in a single batched structured call.
-        """
-        if not candidate_sources:
-            return []
-
-        if not self.client or not settings.ENABLE_SEMANTIC_RELEVANCE_LLM:
-            return [
-                SemanticRelevanceItem(
-                    url=c.get("url", ""),
-                    is_relevant=True,
-                    relevance_score=c.get("candidate_score", 0.70),
-                    matched_concepts=c.get("matched_concepts", []),
-                    reason=f"Matched candidate concept {c.get('matched_concepts', ['domain_signal'])}",
-                )
-                for c in candidate_sources
-            ]
-
-        items_str = "\n".join([
-            f"- URL: {c.get('url')}\n  Title: {c.get('title')}\n  Snippet: {c.get('snippet', '')}\n  Candidate Score: {c.get('candidate_score', 0.5):.2f}"
-            for c in candidate_sources
-        ])
-
-        prompt = f"""You are an enterprise research intelligence evaluator.
-Evaluate the semantic relevance of the following search candidate sources for the specific sub-question:
-
-SUB-QUESTION:
-"{sub_question}"
-
-CANDIDATE SOURCES:
-{items_str}
-
-Evaluate whether each source is relevant to answering the sub-question.
-Be inclusive of sources discussing related technologies, market statistics, regulatory policies, infrastructure impact, or sector analysis even if the headline uses different wording.
-Only mark is_relevant=false if the source is completely off-topic or irrelevant.
-"""
-        try:
-            from google.genai import types
-            config = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=SemanticRelevanceBatchResponse,
-                temperature=0.1,
-            )
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
-            data = json.loads(response.text)
-            parsed = SemanticRelevanceBatchResponse.model_validate(data)
-            return [
-                SemanticRelevanceItem(
-                    url=item.url,
-                    is_relevant=item.is_relevant,
-                    relevance_score=item.relevance_score,
-                    matched_concepts=item.matched_concepts,
-                    reason=item.reason,
-                )
-                for item in parsed.evaluations
-            ]
-        except Exception as e:
-            logger.warning(f"Batch semantic relevance evaluation fallback: {e}")
-            return [
-                SemanticRelevanceItem(
-                    url=c.get("url", ""),
-                    is_relevant=True,
-                    relevance_score=c.get("candidate_score", 0.70),
-                    matched_concepts=c.get("matched_concepts", []),
-                    reason="Validated by candidate match",
-                )
-                for c in candidate_sources
-            ]
 
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
         self.api_key = api_key if api_key is not None else settings.GEMINI_API_KEY
@@ -165,7 +77,7 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             logger.warning("GEMINI_API_KEY not set. GeminiAIProvider operating in fallback mode.")
 
     async def decompose_question(self, question: str) -> List[SubQuestionCandidate]:
-        """Decompose question into structured sub-inquiries using Gemini structured output."""
+        """Decompose question into structured sub-inquiries using Gemini."""
         if not self.client:
             return self._fallback_decompose(question)
 
@@ -188,25 +100,22 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             parsed = SubQuestionListResponse.model_validate(data)
             return parsed.sub_questions
         except Exception as e:
-            logger.error(f"Gemini decompose_question failed: {e}. Using fallback decomposition.")
+            logger.error(f"Gemini decompose_question failed: {e}. Using fallback.")
             return self._fallback_decompose(question)
 
     async def extract_findings_and_evidence(
         self, source_url: str, source_content: str, research_question: str
     ) -> List[FindingCandidate]:
-        """
-        Extract findings strictly grounded in provided source content using Gemini.
-        The prompt explicitly forbids prior knowledge and template findings.
-        """
+        """Extract findings from a single source (used as batch fallback)."""
         if not self.client:
             return self._fallback_extract_findings(source_url, source_content, research_question)
 
         truncated_content = source_content[:8000]
-
         prompt = FINDING_EXTRACTION_SYSTEM_PROMPT.format(
             research_question=research_question,
             source_url=source_url,
             source_content=truncated_content,
+            max_findings=settings.MAX_FINDINGS_PER_SOURCE,
         )
 
         try:
@@ -224,19 +133,21 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             )
             data = json.loads(response.text)
             parsed = FindingListResponse.model_validate(data)
-            for f in parsed.findings:
+            # Enforce per-source cap
+            findings = parsed.findings[:settings.MAX_FINDINGS_PER_SOURCE]
+            for f in findings:
                 f.source_url = source_url
-            return parsed.findings
+            return findings
         except Exception as e:
-            logger.error(f"Gemini extract_findings failed: {e}. Using fallback findings.")
+            logger.error(f"Gemini extract_findings failed: {e}. Using fallback.")
             return self._fallback_extract_findings(source_url, source_content, research_question)
 
     async def extract_findings_from_source_batch(
         self, sources: List[SourceDocumentInput], research_question: str
     ) -> List[FindingCandidate]:
         """
-        Extract findings from a batch of verified source documents in a single structured Gemini call.
-        Enforces strict source attribution and source boundary isolation.
+        Extract findings from a batch of source documents in a single Gemini call.
+        Enforces per-source finding cap in the prompt.
         """
         if not self.client:
             all_findings = []
@@ -251,10 +162,10 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
         if not sources:
             return []
 
-        sources_text_blocks = []
         source_url_map = {s.source_id: s.url for s in sources}
         source_id_by_url = {s.url: s.source_id for s in sources}
 
+        sources_text_blocks = []
         for idx, s in enumerate(sources, start=1):
             truncated = s.content[:6000]
             block = (
@@ -271,6 +182,7 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
         prompt = BATCHED_FINDING_EXTRACTION_SYSTEM_PROMPT.format(
             research_question=research_question,
             sources_text=sources_text,
+            max_findings_per_source=settings.MAX_FINDINGS_PER_SOURCE,
         )
 
         try:
@@ -289,8 +201,8 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             data = json.loads(response.text)
             parsed = FindingListResponse.model_validate(data)
 
-            # Post-process and ensure source attribution integrity
-            validated_findings = []
+            # Post-process: ensure source attribution integrity
+            validated = []
             for f in parsed.findings:
                 if f.source_id and f.source_id in source_url_map:
                     f.source_url = source_url_map[f.source_id]
@@ -299,12 +211,11 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
                 elif len(sources) == 1:
                     f.source_id = sources[0].source_id
                     f.source_url = sources[0].url
+                validated.append(f)
 
-                validated_findings.append(f)
-
-            return validated_findings
+            return validated
         except Exception as e:
-            logger.error(f"Gemini extract_findings_batch failed: {e}. Falling back to single-source extraction.")
+            logger.error(f"Gemini batch extraction failed: {e}. Falling back to single-source.")
             all_findings = []
             for s in sources:
                 f_list = await self.extract_findings_and_evidence(s.url, s.content, research_question)
@@ -317,7 +228,7 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
     async def detect_contradictions_from_findings(
         self, findings: List[Dict[str, Any]]
     ) -> List[ContradictionCandidate]:
-        """Identify genuine contradictions between findings using Gemini."""
+        """Identify contradictions between findings using Gemini."""
         if not self.client or len(findings) < 2:
             return []
 
@@ -325,7 +236,6 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             f"Finding {idx+1}: {f.get('statement', '')}"
             for idx, f in enumerate(findings)
         )
-
         prompt = CONTRADICTION_DETECTION_SYSTEM_PROMPT.format(findings_text=findings_text)
 
         try:
@@ -351,10 +261,7 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
     async def generate_conclusions_from_findings(
         self, question: str, findings: List[Dict[str, Any]]
     ) -> List[ConclusionCandidate]:
-        """
-        Synthesize high-level conclusions grounded strictly in member findings using Gemini.
-        The prompt requires direct answering, evidence limitations disclosure, and finding traceability.
-        """
+        """Synthesize conclusions grounded in member findings using Gemini."""
         if not self.client or not findings:
             return self._fallback_generate_conclusions(question, findings)
 
@@ -362,7 +269,6 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             f"- [{f.get('finding_type', 'fact')}] {f.get('statement', '')} (confidence: {f.get('confidence', 0.0):.2f})"
             for f in findings
         )
-
         prompt = CONCLUSION_SYNTHESIS_SYSTEM_PROMPT.format(
             question=question,
             findings_text=findings_text,
@@ -385,29 +291,26 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             parsed = ConclusionListResponse.model_validate(data)
             return parsed.conclusions
         except Exception as e:
-            logger.error(f"Gemini generate_conclusions failed: {e}. Using fallback synthesis.")
+            logger.error(f"Gemini generate_conclusions failed: {e}. Using fallback.")
             return self._fallback_generate_conclusions(question, findings)
 
-    # ─── Dynamic Fallback Methods ─────────────────────────────────────────
+    # ─── Fallback Methods ────────────────────────────────────────────────
 
     def _fallback_decompose(self, question: str) -> List[SubQuestionCandidate]:
         return [
             SubQuestionCandidate(
                 question=f"What are the current adoption trends and operational benchmarks regarding '{question}'?",
-                sequence_number=1,
-                priority="high",
+                sequence_number=1, priority="high",
                 rationale="Market adoption baseline",
             ),
             SubQuestionCandidate(
                 question=f"What are the key technical implementations and business ROI associated with '{question}'?",
-                sequence_number=2,
-                priority="high",
+                sequence_number=2, priority="high",
                 rationale="Technical execution & financial impact",
             ),
             SubQuestionCandidate(
                 question=f"What risks, compliance constraints, or implementation barriers exist for '{question}'?",
-                sequence_number=3,
-                priority="medium",
+                sequence_number=3, priority="medium",
                 rationale="Risk & governance assessment",
             ),
         ]
@@ -415,13 +318,10 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
     def _fallback_extract_findings(
         self, source_url: str, source_content: str, research_question: str
     ) -> List[FindingCandidate]:
-        """Fallback: extract a simple finding from the first meaningful sentence of source content."""
         lines = [l.strip() for l in source_content.splitlines() if l.strip() and len(l.strip()) > 30]
         if not lines:
             return []
-
         first_sentence = lines[0][:200]
-        excerpt = first_sentence
         return [
             FindingCandidate(
                 statement=first_sentence,
@@ -429,21 +329,21 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
                 confidence=0.60,
                 importance="medium",
                 source_url=source_url,
-                excerpt=excerpt,
+                excerpt=first_sentence,
                 relevance_score=0.60,
                 evidence_type="supporting",
-                rationale="Extracted from source content first meaningful line (fallback mode).",
+                rationale="Extracted from source content (fallback mode).",
             )
         ]
 
     def _fallback_generate_conclusions(
         self, question: str, findings: List[Dict[str, Any]]
     ) -> List[ConclusionCandidate]:
-        finding_statements = [f.get("statement", "") for f in findings if f.get("statement")]
-        if not finding_statements:
+        finding_stmts = [f.get("statement", "") for f in findings if f.get("statement")]
+        if not finding_stmts:
             return [
                 ConclusionCandidate(
-                    statement=f"The available evidence retrieved from external sources is insufficient to fully determine specific claims regarding '{question}'. Further targeted research is recommended.",
+                    statement=f"The available evidence is insufficient to fully determine specific claims regarding '{question}'. Further targeted research is recommended.",
                     confidence=0.30,
                     supporting_finding_statements=[],
                     limitations="No validated findings were available for synthesis.",
@@ -451,9 +351,9 @@ Only mark is_relevant=false if the source is completely off-topic or irrelevant.
             ]
         return [
             ConclusionCandidate(
-                statement=f"Based on {len(finding_statements)} validated findings, preliminary evidence exists regarding '{question}', though coverage may be limited.",
+                statement=f"Based on {len(finding_stmts)} validated findings, preliminary evidence exists regarding '{question}', though coverage may be limited.",
                 confidence=0.65,
-                supporting_finding_statements=finding_statements[:5],
-                limitations="Synthesized from available web evidence; some aspects of the research question may lack direct evidence.",
+                supporting_finding_statements=finding_stmts[:5],
+                limitations="Synthesized from available web evidence; some aspects may lack direct evidence.",
             )
         ]
