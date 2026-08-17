@@ -56,6 +56,9 @@ class Settings(BaseSettings):
                 v = v.replace("postgres://", "postgresql+asyncpg://", 1)
             elif v.startswith("postgresql://") and not v.startswith("postgresql+asyncpg://"):
                 v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+            # asyncpg dialect in SQLAlchemy expects 'ssl' parameter instead of 'sslmode'
+            if "sslmode=" in v:
+                v = v.replace("sslmode=", "ssl=")
         return v or "sqlite+aiosqlite:///./research_platform.db"
 
     @field_validator("CORS_ORIGINS", mode="before")
